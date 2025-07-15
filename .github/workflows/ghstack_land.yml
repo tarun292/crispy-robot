@@ -1,0 +1,132 @@
+name: ghstack land
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  ghstack_land:
+    if: ${{ github.event.issue.pull_request && contains(github.event.comment.body, '/land') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show Environment Variables
+        run: env
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+      - name: Add reaction to comment
+        run: |
+          COMMENT_ID=$(echo "${{ github.event.comment.id }}")
+          REPO="${{ github.repository }}"
+
+          curl -X POST \
+            -H "Authorization: token ${{ steps.app-token.outputs.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+            -d '{"content":"rocket"}'
+      - name: Show Github Object
+        run: |
+          cat <<'EOF'
+          ${{ toJson(github) }}
+          EOF
+      - name: Show Github Event Path Json
+        run: 'cat $GITHUB_EVENT_PATH || true'
+      - name: Check if force flag is present and has reason
+        id: check-force
+        run: |
+          if [[ "$COMMENT" == *"--force"* ]]; then
+            echo "Force flag detected, checking for reason..."
+
+            # Extract text after --force (trim leading/trailing whitespace)
+            REASON=$(echo "$COMMENT" | sed -n 's/.*--force\s*\(.*\)/\1/p' | xargs)
+
+            if [[ -z "$REASON" ]]; then
+              echo "::error::Force flag requires a reason. Please use format: /land --force <reason>"
+              gh pr comment "${{ github.event.issue.html_url }}" --body "⚠️ Force landing failed: You must provide a reason when using --force. Please use the format: \`/land --force <reason>\`"
+              exit 1
+            else
+              echo "Force reason provided: $REASON"
+              echo "force_flag=--force" >> $GITHUB_OUTPUT
+              echo "force_reason=$REASON" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No force flag detected"
+            echo "force_flag=" >> $GITHUB_OUTPUT
+            echo "force_reason=" >> $GITHUB_OUTPUT
+          fi
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.6.9"
+      - name: Get PR details
+        id: get-pr
+        run: |
+          PR_NUMBER=${{ github.event.issue.number }}
+          echo "PR number is $PR_NUMBER"
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+
+          # Get PR details using GitHub API
+          PR_DATA=$(curl -s \
+            -H "Authorization: token ${{ steps.app-token.outputs.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/pulls/$PR_NUMBER")
+
+          # Extract useful information
+          PR_HEAD_REF=$(echo "$PR_DATA" | jq -r .head.ref)
+          PR_HEAD_SHA=$(echo "$PR_DATA" | jq -r .head.sha)
+          PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/$PR_NUMBER"
+
+          echo "pr_branch=$PR_HEAD_REF" >> $GITHUB_OUTPUT
+          echo "pr_sha=$PR_HEAD_SHA" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "pr_branch=$PR_HEAD_REF"
+          echo "pr_sha=$PR_HEAD_SHA"
+          echo "pr_url=$PR_URL"
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: '0'
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      - name: Check Current CI Status
+        if: ${{ steps.check-force.outputs.force_flag == '' }}
+        run: |
+          uv pip install --system requests
+          echo ${{ github.event.issue.number }}
+          .github/workflows/scripts/ghstack-perm-check.py ${{ github.event.issue.number }} ${{steps.get-pr.outputs.pr_branch}} ${{ github.repository }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Log Force Landing
+        if: ${{ steps.check-force.outputs.force_flag != '' }}
+        run: |
+          echo "Force landing PR #${{ steps.get-pr.outputs.pr_number }}"
+          echo "Reason: ${{ steps.check-force.outputs.force_reason }}"
+
+          # Post a comment to the PR with the force reason
+          gh pr comment "${{ steps.get-pr.outputs.pr_url }}" --body "⚠️ **Force landing** initiated by @${{ github.event.comment.user.login }} with reason: ${{ steps.check-force.outputs.force_reason }}"
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Land It!
+        run: |
+          uv pip install --system ghstack
+          git config --global user.email "bot@thinkingmachines.ai"
+          git config --global user.name "ghstack bot"
+          cat <<EOF > ~/.ghstackrc
+          [ghstack]
+          github_url = github.com
+          github_oauth = $GITHUB_TOKEN
+          github_username = foo
+          remote_name = origin
+          EOF
+          if ! ghstack land "${{ steps.get-pr.outputs.pr_url }}"; then
+            gh pr comment "${{ steps.get-pr.outputs.pr_url }}" --body "Failed to land PR using ghstack. See workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
